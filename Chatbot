@@ -1,0 +1,165 @@
+
+
+import faiss
+import gradio as gr
+from pypdf import PdfReader
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from sentence_transformers import SentenceTransformer
+import torch
+
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16 if device == "cuda" else torch.float32
+).to(device)
+
+model.eval()
+
+#pdf processing
+
+def load_pdf(pdf_file):
+    reader = PdfReader(pdf_file)
+    text = ""
+    for page in reader.pages:
+        t = page.extract_text()
+        if t:
+            text += t + "\n"
+    return text
+
+
+def chunk_text(text, chunk_size=350, overlap=50):
+    chunks = []
+    start = 0
+    while start < len(text):
+        chunks.append(text[start:start + chunk_size])
+        start += chunk_size - overlap
+    return chunks
+
+
+def embed_chunks(chunks):
+    return embedder.encode(chunks, convert_to_tensor=True)
+
+
+def build_faiss_index(embeddings):
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings.cpu().numpy())
+    return index
+
+
+def retrieve_chunks(query, index, chunks, k=2):
+    q_emb = embedder.encode([query], convert_to_tensor=True)
+    _, idx = index.search(q_emb.cpu().numpy(), k)
+    return [chunks[i] for i in idx[0]]
+
+#routing
+
+def detect_mode(question, has_doc):
+    if not has_doc:
+        return "chat"
+
+    keywords = ["pdf", "document", "file", "according to"]
+    return "rag" if any(k in question.lower() for k in keywords) else "chat"
+
+#m/m
+
+def build_memory(history, max_turns=3):
+    messages = []
+    for q, a in history[-max_turns:]:
+        messages.append({"role": "user", "content": q})
+        messages.append({"role": "assistant", "content": a})
+    return messages
+
+#response gen
+
+def generate_response(history_msgs, question, context=None):
+    system_prompt = (
+        "You are a helpful AI assistant. "
+        "Explain concepts clearly using short paragraphs and bullet points. "
+        "Keep answers concise but informative."
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history_msgs)
+
+    if context:
+        messages.append({"role": "system", "content": f"Document context:\n{context}"})
+
+    messages.append({"role": "user", "content": question})
+
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        return_tensors="pt",
+        add_generation_prompt=True
+    ).to(device)
+
+    output = model.generate(
+        inputs,
+        max_new_tokens=180,   
+        do_sample=False
+    )
+
+    return tokenizer.decode(output[0], skip_special_tokens=True)
+
+#main chat
+
+def chat(question, history, index, chunks):
+    if history is None:
+        history = []
+
+    history_msgs = build_memory(history)
+    mode = detect_mode(question, index is not None)
+
+    if mode == "rag":
+        retrieved = retrieve_chunks(question, index, chunks)
+        context = "\n".join(retrieved)
+        answer = generate_response(history_msgs, question, context)
+    else:
+        answer = generate_response(history_msgs, question)
+
+    history.append((question, answer))
+    return history, history
+
+# pdf handler
+
+def process_pdf(pdf_file):
+    if pdf_file is None:
+        return None, None, "📄 No document uploaded"
+
+    text = load_pdf(pdf_file)
+    chunks = chunk_text(text)
+    embeddings = embed_chunks(chunks)
+    index = build_faiss_index(embeddings)
+
+    return index, chunks, "✅ Document indexed"
+
+#ui
+
+with gr.Blocks() as demo:
+    gr.Markdown("## ⚡ Fast AI Assistant (Chat + Optional RAG)")
+
+    with gr.Row():
+        pdf = gr.File(label="Optional PDF", file_types=[".pdf"])
+        status = gr.Markdown("📄 No document uploaded")
+
+    index_state = gr.State(None)
+    chunks_state = gr.State(None)
+    chat_state = gr.State([])
+
+    pdf.change(process_pdf, pdf, [index_state, chunks_state, status])
+
+    chatbot = gr.Chatbot()
+
+    txt = gr.Textbox(placeholder="Ask anything…", show_label=False)
+
+    txt.submit(chat, [txt, chat_state, index_state, chunks_state],
+               [chatbot, chat_state])
+
+demo.launch()
