@@ -1,0 +1,107 @@
+
+!pip install streamlit pdfplumber transformers sentencepiece torch gTTS
+
+import streamlit as st
+import pdfplumber
+import re
+from transformers import pipeline
+from gtts import gTTS
+from io import BytesIO
+
+st.set_page_config(
+    page_title="AI Resume Narrator",
+    layout="centered"
+)
+
+st.title("AI Resume Narrator")
+st.write(
+    "Upload **any resume PDF** to generate a neutral professional summary "
+    "and hear it spoken in real time."
+)
+
+
+@st.cache_resource
+def load_summarizer():
+    return pipeline(
+        "summarization",
+        model="facebook/bart-large-cnn"
+    )
+
+summarizer = load_summarizer()
+
+
+def extract_text_from_pdf(uploaded_file):
+    text = ""
+    with pdfplumber.open(uploaded_file) as pdf:
+        for page in pdf.pages:
+            if page.extract_text():
+                text += page.extract_text() + " "
+    return text.lower()
+
+def clean_text(text):
+    text = re.sub(r'[•●▪]', ' ', text)
+    text = re.sub(r'[^a-z0-9., ]', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def chunk_text(text, max_words=450):
+    words = text.split()
+    return [
+        " ".join(words[i:i+max_words])
+        for i in range(0, len(words), max_words)
+    ]
+
+
+def text_to_audio(text):
+    buffer = BytesIO()
+    tts = gTTS(text=text, lang="en", slow=False)
+    tts.write_to_fp(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+uploaded_file = st.file_uploader(
+    "Upload your resume (PDF)",
+    type=["pdf"]
+)
+
+if uploaded_file:
+
+    with st.spinner("🔍 Reading resume..."):
+        raw_text = extract_text_from_pdf(uploaded_file)
+        cleaned_text = clean_text(raw_text)
+
+    with st.spinner("🧠 Generating professional summary..."):
+        chunks = chunk_text(cleaned_text)
+
+        summaries = []
+        for chunk in chunks[:3]:  # limit for speed
+            summary = summarizer(
+                chunk,
+                max_length=120,
+                min_length=60,
+                do_sample=False
+            )[0]["summary_text"]
+            summaries.append(summary)
+
+        final_summary = " ".join(summaries)
+
+    spoken_text = (
+        "Hello. Here is a brief professional overview. "
+        f"{final_summary} "
+        "Thank you for listening."
+    )
+
+    
+    st.subheader("📝 Generated Professional Summary")
+    st.write(spoken_text)
+
+  
+    if st.button("🔊 Play Audio Summary"):
+        audio_buffer = text_to_audio(spoken_text)
+        st.audio(audio_buffer, format="audio/mp3")
+
+st.markdown("---")
+st.caption(
+    "Built using NLP-based abstractive summarization and real-time speech synthesis."
+)
